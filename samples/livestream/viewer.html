@@ -1,0 +1,355 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>WebTransport Livestream - Viewer</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+        
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+        }
+        
+        .header p {
+            font-size: 1.1em;
+            opacity: 0.9;
+        }
+        
+        .content {
+            padding: 30px;
+        }
+        
+        .config-section {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        
+        .config-section h3 {
+            color: #11998e;
+            margin-bottom: 15px;
+        }
+        
+        .form-group {
+            margin-bottom: 15px;
+        }
+        
+        .form-group label {
+            display: block;
+            font-weight: 600;
+            margin-bottom: 5px;
+            color: #333;
+        }
+        
+        .form-group input {
+            width: 100%;
+            padding: 10px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            font-size: 14px;
+            transition: border-color 0.3s;
+        }
+        
+        .form-group input:focus {
+            outline: none;
+            border-color: #11998e;
+        }
+        
+        .controls {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin: 20px 0;
+        }
+        
+        button {
+            padding: 12px 30px;
+            border: none;
+            border-radius: 6px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        button.primary {
+            background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+            color: white;
+        }
+        
+        button.primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(17, 153, 142, 0.4);
+        }
+        
+        button.danger {
+            background: #f44336;
+            color: white;
+        }
+        
+        button.danger:hover {
+            background: #d32f2f;
+        }
+        
+        button:disabled {
+            background: #ccc;
+            cursor: not-allowed;
+            transform: none;
+        }
+        
+        .video-container {
+            position: relative;
+            background: #000;
+            border-radius: 8px;
+            overflow: hidden;
+            margin: 20px 0;
+        }
+        
+        video {
+            width: 100%;
+            max-height: 600px;
+            display: block;
+            object-fit: contain;
+        }
+        
+        .video-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: rgba(0,0,0,0.8);
+            color: white;
+            font-size: 1.5em;
+            pointer-events: none;
+        }
+        
+        .video-overlay.hidden {
+            display: none;
+        }
+        
+        .status-badge {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            padding: 8px 20px;
+            border-radius: 20px;
+            font-weight: 600;
+            font-size: 14px;
+            backdrop-filter: blur(10px);
+        }
+        
+        .status-badge.connecting {
+            background: rgba(255, 193, 7, 0.9);
+            color: #000;
+        }
+        
+        .status-badge.live {
+            background: rgba(244, 67, 54, 0.9);
+            color: white;
+            animation: pulse 2s infinite;
+        }
+        
+        .status-badge.buffering {
+            background: rgba(33, 150, 243, 0.9);
+            color: white;
+        }
+        
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+        
+        .stats {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+        }
+        
+        .stat-item {
+            text-align: center;
+        }
+        
+        .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #11998e;
+        }
+        
+        .stat-label {
+            color: #666;
+            font-size: 0.9em;
+            margin-top: 5px;
+        }
+        
+        .quality-indicator {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            background: rgba(0,0,0,0.7);
+            padding: 8px 15px;
+            border-radius: 20px;
+            color: white;
+            font-size: 14px;
+        }
+        
+        .quality-bars {
+            display: flex;
+            gap: 2px;
+        }
+        
+        .quality-bar {
+            width: 3px;
+            height: 12px;
+            background: #666;
+            border-radius: 1px;
+        }
+        
+        .quality-bar.active {
+            background: #4caf50;
+        }
+        
+        .log {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 8px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            margin-top: 20px;
+        }
+        
+        .log-entry {
+            padding: 2px 0;
+        }
+        
+        .log-entry.error {
+            color: #f44336;
+        }
+        
+        .log-entry.success {
+            color: #4caf50;
+        }
+        
+        .log-entry.info {
+            color: #2196f3;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📺 WebTransport Livestream</h1>
+            <p>Viewer</p>
+        </div>
+        
+        <div class="content">
+            <div class="config-section">
+                <h3>📡 Stream Connection</h3>
+                <div class="form-group">
+                    <label for="server-url">Server URL:</label>
+                    <input type="text" id="server-url" value="https://127.0.0.1:4433/watch/my-stream">
+                </div>
+            </div>
+            
+            <div class="controls">
+                <button id="connect-btn" class="primary">Connect to Stream</button>
+                <button id="disconnect-btn" class="danger" disabled>Disconnect</button>
+            </div>
+            
+            <div class="video-container">
+                <video id="remote-video" autoplay playsinline></video>
+                <div class="video-overlay" id="video-overlay">
+                    <div>⏸ Stream not connected</div>
+                </div>
+                <div class="status-badge connecting" id="status-badge" style="display: none;">
+                    ⏳ Connecting...
+                </div>
+                <div class="quality-indicator">
+                    <div class="quality-bars">
+                        <div class="quality-bar" id="q1"></div>
+                        <div class="quality-bar" id="q2"></div>
+                        <div class="quality-bar" id="q3"></div>
+                        <div class="quality-bar" id="q4"></div>
+                        <div class="quality-bar" id="q5"></div>
+                    </div>
+                    <span id="quality-text">Excellent</span>
+                </div>
+            </div>
+            
+            <div class="stats">
+                <div class="stat-item">
+                    <div class="stat-value" id="frames-received">0</div>
+                    <div class="stat-label">Frames Received</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="bytes-received">0</div>
+                    <div class="stat-label">KB Received</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="fps">0</div>
+                    <div class="stat-label">FPS</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="latency">0</div>
+                    <div class="stat-label">Latency (ms)</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="buffer-size">0</div>
+                    <div class="stat-label">Buffer Size</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-value" id="dropped-frames">0</div>
+                    <div class="stat-label">Dropped Frames</div>
+                </div>
+            </div>
+            
+            <div class="log" id="log"></div>
+        </div>
+    </div>
+    
+    <script src="js/livestream_viewer.js"></script>
+</body>
+</html>
