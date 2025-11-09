@@ -6,6 +6,12 @@ class LivestreamPublisher {
         this.videoTrack = null;
         this.processorReader = null;
         this.isStreaming = false;
+
+        // --- Thay đổi: Thêm Datagram Writer và Frame Counter ---
+        this.datagramWriter = null;
+        this.frameCounter = 0; // Dùng để đánh số ID cho frame
+        this.DATAGRAM_MAX_PAYLOAD = 1024; // Gửi 1KB mỗi datagram
+        this.HEADER_SIZE = 24; // Kích thước header phân mảnh
         
         // Statistics
         this.stats = {
@@ -168,6 +174,14 @@ class LivestreamPublisher {
         
         await this.transport.ready;
         this.log('WebTransport connected!', 'success');
+
+        // --- Thay đổi: Lấy Datagram Writer ---
+        try {
+            this.datagramWriter = this.transport.datagrams.writable.getWriter();
+            this.log('Datagram writer ready.', 'success');
+        } catch (e) {
+            throw new Error(`Failed to get datagram writer: ${e.message}`);
+        }
         
         // Handle connection closure
         this.transport.closed.then(() => {
@@ -285,66 +299,119 @@ class LivestreamPublisher {
         console.log('RVFC frame capture started');
     }
     
+    // async handleEncodedChunk(chunk, metadata) {
+    //     try {
+    //         console.log(`Encoding chunk: type=${chunk.type}, timestamp=${chunk.timestamp}, size=${chunk.byteLength}`);
+            
+    //         // Serialize encoded chunk
+    //         const data = new Uint8Array(chunk.byteLength + 16);
+    //         const view = new DataView(data.buffer);
+            
+    //         // Header: [timestamp(8), duration(4), type(1), size(3)]
+    //         view.setBigUint64(0, BigInt(chunk.timestamp), true);
+    //         view.setUint32(8, chunk.duration || 0, true);
+    //         view.setUint8(12, chunk.type === 'key' ? 1 : 0);
+    //         view.setUint32(13, chunk.byteLength, true); // Only use 3 bytes in practice
+            
+    //         // Copy chunk data
+    //         chunk.copyTo(data.subarray(16));
+            
+    //         console.log(`Serialized frame: ${data.byteLength} bytes (header: 16, payload: ${chunk.byteLength})`);
+            
+    //         // Send via WebTransport unidirectional stream
+    //         await this.sendFrame(data);
+            
+    //         this.stats.framesSent++;
+    //         this.stats.bytesSent += data.byteLength;
+            
+    //         console.log(`Frame sent successfully! Total frames: ${this.stats.framesSent}`);
+            
+    //     } catch (error) {
+    //         this.log(`Error handling chunk: ${error.message}`, 'error');
+    //         console.error('handleEncodedChunk error:', error);
+    //     }
+    // }
+
+    // --- Thay đổi lớn: Xử lý và Phân mảnh Chunk ---
     async handleEncodedChunk(chunk, metadata) {
         try {
-            console.log(`Encoding chunk: type=${chunk.type}, timestamp=${chunk.timestamp}, size=${chunk.byteLength}`);
+            // Lấy dữ liệu frame
+            const chunkData = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(chunkData);
             
-            // Serialize encoded chunk
-            const data = new Uint8Array(chunk.byteLength + 16);
-            const view = new DataView(data.buffer);
+            const frameId = this.frameCounter++;
+            const isKey = chunk.type === 'key';
+            const totalFragments = Math.ceil(chunkData.byteLength / this.DATAGRAM_MAX_PAYLOAD);
+
+            console.log(`Sending frame ${frameId} (key: ${isKey}) in ${totalFragments} fragments.`);
+
+            // Phân mảnh và gửi
+            for (let i = 0; i < totalFragments; i++) {
+                const offset = i * this.DATAGRAM_MAX_PAYLOAD;
+                const payload = chunkData.subarray(offset, offset + this.DATAGRAM_MAX_PAYLOAD);
+                
+                // Tạo datagram với header
+                const datagram = new Uint8Array(this.HEADER_SIZE + payload.byteLength);
+                const view = new DataView(datagram.buffer);
+
+                // Header (24 bytes)
+                view.setUint32(0, frameId, true);             // Frame ID (4 bytes)
+                view.setUint16(4, i, true);                   // Fragment ID (2 bytes)
+                view.setUint16(6, totalFragments, true);      // Total Fragments (2 bytes)
+                view.setUint8(8, isKey ? 1 : 0);              // Is Keyframe (1 byte)
+                // 3 bytes dự trữ (9, 10, 11)
+                view.setBigUint64(12, BigInt(chunk.timestamp), true); // Timestamp (8 bytes)
+                view.setUint32(20, chunk.duration || 0, true);  // Duration (4 bytes)
+
+                // Payload
+                datagram.set(payload, this.HEADER_SIZE);
+
+                // Gửi datagram fragment
+                if (this.datagramWriter) {
+                    await this.datagramWriter.write(datagram);
+                }
+            }
             
-            // Header: [timestamp(8), duration(4), type(1), size(3)]
-            view.setBigUint64(0, BigInt(chunk.timestamp), true);
-            view.setUint32(8, chunk.duration || 0, true);
-            view.setUint8(12, chunk.type === 'key' ? 1 : 0);
-            view.setUint32(13, chunk.byteLength, true); // Only use 3 bytes in practice
-            
-            // Copy chunk data
-            chunk.copyTo(data.subarray(16));
-            
-            console.log(`Serialized frame: ${data.byteLength} bytes (header: 16, payload: ${chunk.byteLength})`);
-            
-            // Send via WebTransport unidirectional stream
-            await this.sendFrame(data);
-            
+            // Cập nhật thống kê
             this.stats.framesSent++;
-            this.stats.bytesSent += data.byteLength;
-            
-            console.log(`Frame sent successfully! Total frames: ${this.stats.framesSent}`);
+            this.stats.bytesSent += chunkData.byteLength; // Chỉ tính payload
             
         } catch (error) {
             this.log(`Error handling chunk: ${error.message}`, 'error');
             console.error('handleEncodedChunk error:', error);
+            if (this.isStreaming) {
+                this.stop(); // Dừng nếu có lỗi gửi
+            }
         }
     }
     
-    async sendFrame(data) {
-        try {
-            console.log(`Creating unidirectional stream to send ${data.byteLength} bytes...`);
+    // async sendFrame(data) {
+    //     try {
+    //         console.log(`Creating unidirectional stream to send ${data.byteLength} bytes...`);
             
-            if (!this.transport || this.transport.state === 'closed' || this.transport.state === 'failed') {
-                throw new Error('WebTransport connection is closed');
-            }
+    //         if (!this.transport || this.transport.state === 'closed' || this.transport.state === 'failed') {
+    //             throw new Error('WebTransport connection is closed');
+    //         }
             
-            const stream = await this.transport.createUnidirectionalStream();
-            const writer = stream.getWriter();
-            await writer.write(data);
-            await writer.close();
-            console.log('Stream closed successfully');
-        } catch (error) {
-            console.error('sendFrame error:', error);
+    //         const stream = await this.transport.createUnidirectionalStream();
+    //         const writer = stream.getWriter();
+    //         await writer.write(data);
+    //         await writer.close();
+    //         console.log('Stream closed successfully');
+    //     } catch (error) {
+    //         console.error('sendFrame error:', error);
             
-            // If connection is lost, stop streaming
-            if (error.message.includes('Connection') || error.message.includes('closed')) {
-                this.log('Connection lost, stopping stream', 'error');
-                this.stop();
-            }
+    //         // If connection is lost, stop streaming
+    //         if (error.message.includes('Connection') || error.message.includes('closed')) {
+    //             this.log('Connection lost, stopping stream', 'error');
+    //             this.stop();
+    //         }
             
-            if (this.isStreaming) {
-                throw error;
-            }
-        }
-    }
+    //         if (this.isStreaming) {
+    //             throw error;
+    //         }
+    //     }
+    // }
     
     updateStats() {
         if (!this.stats.startTime) return;
@@ -394,6 +461,14 @@ class LivestreamPublisher {
             this.stream.getTracks().forEach(track => track.stop());
             this.stream = null;
             this.videoTrack = null;
+        }
+
+        // Đóng datagram writer
+        if (this.datagramWriter) {
+            try {
+                this.datagramWriter.close();
+            } catch(e) {}
+            this.datagramWriter = null;
         }
         
         // Close transport

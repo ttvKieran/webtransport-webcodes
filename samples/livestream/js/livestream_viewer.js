@@ -7,17 +7,26 @@ class LivestreamViewer {
         this.generator = null;
         this.writable = null;
         this.writer = null;
-        
-        // Frame buffer for smooth playback
+        // --- THAY ĐỔI: Thêm cờ chờ Keyframe ---
+        this.hasReceivedKeyframe = false; // Phải chờ Keyframe đầu tiên
+
+        // Logic Bộ đệm và Tái lắp ráp
+        this.reassemblyBuffer = new Map(); // Map<frameId, { fragments, ... }>
+        this.lastPlayedFrameId = -1; // Để đảm bảo thứ tự
+        this.HEADER_SIZE = 24; // Phải khớp với Publisher
+        this.reassemblyTimeout = 500; // 500ms timeout cho fragments
+        this.cleanupInterval = null; // Interval ID
+
         this.frameBuffer = [];
         this.maxBufferSize = 5; // Buffer up to 5 frames
-        this.isPlaying = false;
+        this.isPlaying = false;;
         
         // Statistics
         this.stats = {
             framesReceived: 0,
             bytesReceived: 0,
             droppedFrames: 0,
+            lostFrames: 0, // Bị rớt do mạng (datagram)
             lastFpsUpdate: Date.now(),
             fpsCounter: 0,
             latencySum: 0,
@@ -139,8 +148,12 @@ class LivestreamViewer {
         this.transport = new WebTransport(url);
         
         // Setup stream reader IMMEDIATELY (before waiting for ready)
-        console.log('Setting up incoming stream reader...');
-        this.setupStreamReader();
+        // console.log('Setting up incoming stream reader...');
+        // this.setupStreamReader();
+
+        // --- Thay đổi: Thiết lập Datagram Reader ---
+        console.log('Setting up datagram reader...');
+        this.setupDatagramReader(); // Bắt đầu lắng nghe datagram
         
         await this.transport.ready;
         this.log('WebTransport connected!', 'success');
@@ -159,37 +172,163 @@ class LivestreamViewer {
         });
     }
     
-    setupStreamReader() {
-        // Start reading incoming streams immediately
-        const streamReader = this.transport.incomingUnidirectionalStreams.getReader();
+    // setupStreamReader() {
+    //     // Start reading incoming streams immediately
+    //     const streamReader = this.transport.incomingUnidirectionalStreams.getReader();
         
-        (async () => {
-            console.log('Stream reader loop started');
-            while (true) {
-                try {
-                    const { value: stream, done } = await streamReader.read();
+    //     (async () => {
+    //         console.log('Stream reader loop started');
+    //         while (true) {
+    //             try {
+    //                 const { value: stream, done } = await streamReader.read();
                     
-                    if (done) {
-                        console.log('Stream reader done');
-                        break;
-                    }
+    //                 if (done) {
+    //                     console.log('Stream reader done');
+    //                     break;
+    //                 }
                     
-                    console.log('Received new incoming stream');
+    //                 console.log('Received new incoming stream');
                     
-                    // Each stream contains one encoded frame
-                    this.receiveFrame(stream);
+    //                 // Each stream contains one encoded frame
+    //                 this.receiveFrame(stream);
                     
-                } catch (error) {
-                    console.error('Stream reading error:', error);
-                    break;
-                }
+    //             } catch (error) {
+    //                 console.error('Stream reading error:', error);
+    //                 break;
+    //             }
+    //         }
+            
+    //         console.log('Stream reader loop exited');
+    //     })();
+        
+    //     this.log('Stream reader setup complete', 'success');
+    // }
+
+    // --- Thêm hàm setupDatagramReader() ---
+    async setupDatagramReader() {
+        this.reassemblyBuffer.clear();
+        this.lastPlayedFrameId = -1;
+        
+        try {
+            const reader = this.transport.datagrams.readable.getReader();
+            console.log('Datagram reader loop started');
+
+            while (this.transport) {
+                const { value: datagram, done } = await reader.read();
+                if (done) break;
+                
+                this.stats.bytesReceived += datagram.byteLength;
+                await this.handleDatagram(datagram);
+            }
+        } catch (e) {
+            this.log(`Error reading datagrams: ${e.message}`, 'error');
+        }
+    }
+
+    // BIẾN HÀM NÀY THÀNH ASYNC
+async handleDatagram(datagram) {
+    if (datagram.byteLength < this.HEADER_SIZE) {
+        console.warn('Received datagram smaller than header');
+        return; 
+    }
+
+    // (Giữ nguyên logic phân tích header)
+    const view = new DataView(datagram.buffer);
+    const frameId = view.getUint32(0, true);
+    const fragmentId = view.getUint16(4, true);
+    const totalFragments = view.getUint16(6, true);
+    const isKey = view.getUint8(8) === 1;
+    const timestamp = Number(view.getBigUint64(12, true));
+    const duration = view.getUint32(20, true);
+    const payload = datagram.slice(this.HEADER_SIZE);
+
+    if (frameId <= this.lastPlayedFrameId) return;
+
+    // (Giữ nguyên logic khởi tạo reassemblyBuffer)
+    if (!this.reassemblyBuffer.has(frameId)) {
+        // ... (logic dọn dẹp)
+        this.reassemblyBuffer.set(frameId, {
+            fragments: new Array(totalFragments),
+            receivedCount: 0,
+            totalFragments: totalFragments,
+            isKey: isKey,
+            timestamp: timestamp,
+            duration: duration,
+            lastReceived: Date.now()
+        });
+    }
+    
+    const frameEntry = this.reassemblyBuffer.get(frameId);
+    frameEntry.lastReceived = Date.now(); 
+
+    if (!frameEntry.fragments[fragmentId]) {
+        frameEntry.fragments[fragmentId] = payload;
+        frameEntry.receivedCount++;
+    }
+
+    if (frameEntry.receivedCount === frameEntry.totalFragments) {
+        // Tái lắp ráp frame
+        const frameData = this.reassembleFrame(frameEntry.fragments);
+        const chunk = new EncodedVideoChunk({
+            type: frameEntry.isKey ? 'key' : 'delta',
+            timestamp: frameEntry.timestamp,
+            duration: frameEntry.duration,
+            data: frameData
+        });
+
+        // 1. KIỂM TRA NẾU CHƯA CÓ KEYFRAME
+        if (!this.hasReceivedKeyframe) {
+            if (!frameEntry.isKey) {
+                this.log(`Discarding delta frame ${frameId} (waiting for first keyframe)`, 'info');
+                this.reassemblyBuffer.delete(frameId);
+                return; // Bỏ qua
             }
             
-            console.log('Stream reader loop exited');
-        })();
+            this.log('Received first keyframe, configuring decoder...', 'success');
+            
+            // --- SỬA LỖI: PHẢI AWAIT HÀM CONFIGURE ---
+            if (this.decoder.state === 'unconfigured') {
+                await this.configureDecoder(chunk); // ĐỢI HÀM NÀY CHẠY XONG
+            }
+            
+            // (Bây giờ decoder đã 'configured')
+            this.decoder.decode(chunk); 
+            this.hasReceivedKeyframe = true; 
         
-        this.log('Stream reader setup complete', 'success');
+        } else {
+            // 2. ĐÃ CÓ KEYFRAME, GIẢI MÃ BÌNH THƯỜNG
+            if (this.decoder.state === 'configured') {
+                if (frameId > this.lastPlayedFrameId) {
+                    this.decoder.decode(chunk);
+                }
+            }
+        }
+        
+        // 3. CẬP NHẬT STATS VÀ DỌN DẸP
+        if (frameId > this.lastPlayedFrameId) {
+            // (Giữ nguyên logic cập nhật stats)
+            this.stats.framesReceived++;
+            this.stats.fpsCounter++;
+            this.lastPlayedFrameId = frameId;
+            // (Giữ nguyên logic latency)
+        }
+        
+        this.reassemblyBuffer.delete(frameId);
     }
+}
+
+    // --- Thêm hàm trợ giúp Reassemble ---
+    reassembleFrame(fragments) {
+        const totalLength = fragments.reduce((acc, chunk) => acc + chunk.length, 0);
+        const data = new Uint8Array(totalLength);
+        let offset = 0;
+        for (const chunk of fragments) {
+            data.set(chunk, offset);
+            offset += chunk.length;
+        }
+        return data;
+    }
+    
     
     async initDecoder() {
         this.log('Initializing video decoder...', 'info');
@@ -203,110 +342,145 @@ class LivestreamViewer {
         this.log('Decoder ready (waiting for configuration)', 'success');
     }
     
-    async receiveFrame(stream) {
-        try {
-            console.log('Reading frame from stream...');
-            const reader = stream.getReader();
-            const chunks = [];
+    // async receiveFrame(stream) {
+    //     try {
+    //         console.log('Reading frame from stream...');
+    //         const reader = stream.getReader();
+    //         const chunks = [];
             
-            while (true) {
-                const { value, done } = await reader.read();
-                if (done) break;
-                chunks.push(value);
-            }
+    //         while (true) {
+    //             const { value, done } = await reader.read();
+    //             if (done) break;
+    //             chunks.push(value);
+    //         }
             
-            console.log(`Read ${chunks.length} chunks from stream`);
+    //         console.log(`Read ${chunks.length} chunks from stream`);
             
-            // Combine chunks
-            const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
-            const data = new Uint8Array(totalLength);
-            let offset = 0;
-            for (const chunk of chunks) {
-                data.set(chunk, offset);
-                offset += chunk.length;
-            }
+    //         // Combine chunks
+    //         const totalLength = chunks.reduce((acc, chunk) => acc + chunk.length, 0);
+    //         const data = new Uint8Array(totalLength);
+    //         let offset = 0;
+    //         for (const chunk of chunks) {
+    //             data.set(chunk, offset);
+    //             offset += chunk.length;
+    //         }
             
-            this.stats.bytesReceived += data.byteLength;
+    //         this.stats.bytesReceived += data.byteLength;
             
-            console.log(`Received frame: ${data.byteLength} bytes`);
+    //         console.log(`Received frame: ${data.byteLength} bytes`);
             
-            // Parse frame header
-            if (data.byteLength < 16) {
-                console.error(`Frame too short: ${data.byteLength} bytes`);
-                return;
-            }
+    //         // Parse frame header
+    //         if (data.byteLength < 16) {
+    //             console.error(`Frame too short: ${data.byteLength} bytes`);
+    //             return;
+    //         }
             
-            const view = new DataView(data.buffer);
-            const timestamp = Number(view.getBigUint64(0, true));
-            const duration = view.getUint32(8, true);
-            const isKey = view.getUint8(12) === 1;
-            const size = view.getUint32(13, true) & 0xFFFFFF; // 3 bytes
+    //         const view = new DataView(data.buffer);
+    //         const timestamp = Number(view.getBigUint64(0, true));
+    //         const duration = view.getUint32(8, true);
+    //         const isKey = view.getUint8(12) === 1;
+    //         const size = view.getUint32(13, true) & 0xFFFFFF; // 3 bytes
             
-            const frameData = data.slice(16);
+    //         const frameData = data.slice(16);
             
-            console.log(`Frame header - timestamp: ${timestamp}, duration: ${duration}, isKey: ${isKey}, size: ${size}, actual: ${frameData.byteLength}`);
+    //         console.log(`Frame header - timestamp: ${timestamp}, duration: ${duration}, isKey: ${isKey}, size: ${size}, actual: ${frameData.byteLength}`);
             
-            // Create EncodedVideoChunk
-            const chunk = new EncodedVideoChunk({
-                type: isKey ? 'key' : 'delta',
-                timestamp: timestamp,
-                duration: duration,
-                data: frameData
-            });
+    //         // Create EncodedVideoChunk
+    //         const chunk = new EncodedVideoChunk({
+    //             type: isKey ? 'key' : 'delta',
+    //             timestamp: timestamp,
+    //             duration: duration,
+    //             data: frameData
+    //         });
             
-            // Configure decoder on first keyframe
-            if (isKey && this.decoder.state === 'unconfigured') {
-                this.log('Found keyframe, configuring decoder...', 'info');
-                await this.configureDecoderFromChunk(chunk, frameData);
-            }
+    //         // Configure decoder on first keyframe
+    //         if (isKey && this.decoder.state === 'unconfigured') {
+    //             this.log('Found keyframe, configuring decoder...', 'info');
+    //             await this.configureDecoderFromChunk(chunk, frameData);
+    //         }
             
-            // Decode frame
-            if (this.decoder.state === 'configured') {
-                this.decoder.decode(chunk);
-                this.stats.framesReceived++;
-                this.stats.fpsCounter++;
+    //         // Decode frame
+    //         if (this.decoder.state === 'configured') {
+    //             this.decoder.decode(chunk);
+    //             this.stats.framesReceived++;
+    //             this.stats.fpsCounter++;
                 
-                // Calculate latency
-                const now = Date.now();
-                const latency = now - (timestamp / 1000);
-                this.stats.latencySum += latency;
-                this.stats.latencyCount++;
+    //             // Calculate latency
+    //             const now = Date.now();
+    //             const latency = now - (timestamp / 1000);
+    //             this.stats.latencySum += latency;
+    //             this.stats.latencyCount++;
                 
-                console.log(`Decoded frame #${this.stats.framesReceived} (keyframe: ${isKey})`);
-            } else {
-                console.warn(`Skipping frame - decoder state: ${this.decoder.state}, isKey: ${isKey}`);
-            }
+    //             console.log(`Decoded frame #${this.stats.framesReceived} (keyframe: ${isKey})`);
+    //         } else {
+    //             console.warn(`Skipping frame - decoder state: ${this.decoder.state}, isKey: ${isKey}`);
+    //         }
             
-        } catch (error) {
-            if (this.isConnected) {
-                this.log(`Frame receive error: ${error.message}`, 'error');
-                console.error('Frame receive error:', error);
-            }
-        }
-    }
+    //     } catch (error) {
+    //         if (this.isConnected) {
+    //             this.log(`Frame receive error: ${error.message}`, 'error');
+    //             console.error('Frame receive error:', error);
+    //         }
+    //     }
+    // }
     
-    async configureDecoderFromChunk(chunk, frameData) {
+    // async configureDecoderFromChunk(chunk, frameData) {
+    //     this.log('Configuring decoder from first keyframe...', 'info');
+        
+    //     // Try to detect codec from frame data
+    //     let codec = 'vp8';
+        
+    //     // Simple heuristic: VP8 starts with specific bytes
+    //     if (frameData[0] === 0x10 || frameData[0] === 0x30) {
+    //         codec = 'vp8';
+    //     } else if (frameData[0] === 0x82 || frameData[0] === 0x83) {
+    //         codec = 'vp09.00.10.08';
+    //     }
+        
+    //     try {
+    //         this.decoder.configure({
+    //             codec: codec,
+    //             optimizeForLatency: true
+    //         });
+            
+    //         this.log(`Decoder configured with codec: ${codec}`, 'success');
+            
+    //         // Initialize video output
+    //         await this.initVideoOutput();
+            
+    //     } catch (error) {
+    //         this.log(`Decoder configuration error: ${error.message}`, 'error');
+    //         throw error;
+    //     }
+    // }
+
+    // --- Thay đổi: Hàm configureDecoder (không cần đoán codec) ---
+    async configureDecoder(chunk) {
         this.log('Configuring decoder from first keyframe...', 'info');
         
-        // Try to detect codec from frame data
-        let codec = 'vp8';
-        
-        // Simple heuristic: VP8 starts with specific bytes
-        if (frameData[0] === 0x10 || frameData[0] === 0x30) {
-            codec = 'vp8';
-        } else if (frameData[0] === 0x82 || frameData[0] === 0x83) {
-            codec = 'vp09.00.10.08';
+        // VP8 là codec mặc định trong ví dụ này. 
+        // Đối với các codec khác (VP9, H264), cần thêm logic
+        // để gửi 'description' (thông tin codec) từ Publisher.
+        let config = {
+            codec: 'vp8',
+            optimizeForLatency: true
+        };
+
+        // Cố gắng lấy mô tả từ chunk nếu có
+        if (chunk.description) {
+            config.description = chunk.description;
         }
         
         try {
-            this.decoder.configure({
-                codec: codec,
-                optimizeForLatency: true
-            });
+            // Kiểm tra hỗ trợ
+            const support = await VideoDecoder.isConfigSupported(config);
+            if (!support.supported) {
+                throw new Error(`Decoder config not supported: ${config.codec}`);
+            }
+
+            this.decoder.configure(config);
+            this.log(`Decoder configured with codec: ${config.codec}`, 'success');
             
-            this.log(`Decoder configured with codec: ${codec}`, 'success');
-            
-            // Initialize video output
             await this.initVideoOutput();
             
         } catch (error) {
@@ -455,6 +629,14 @@ class LivestreamViewer {
     }
     
     cleanup() {
+
+        // --- THÊM: Reset cờ ---
+        this.hasReceivedKeyframe = false; 
+
+        if (this.cleanupInterval) {
+            clearInterval(this.cleanupInterval);
+            this.cleanupInterval = null;
+        }
         // Stop playback
         this.isPlaying = false;
         

@@ -27,6 +27,7 @@ from aioquic.h3.events import (
     HeadersReceived,
     DataReceived,
     WebTransportStreamDataReceived,
+    DatagramReceived # Thêm DatagramReceived
 )
 from aioquic.quic.events import QuicEvent, ProtocolNegotiated, StreamReset
 
@@ -47,9 +48,9 @@ class LiveStream:
         self.stream_id = stream_id
         self.publisher = None
         self.viewers = set()
-        self.frame_buffer = deque(maxlen=30)  # Keep last 30 frames
-        self.last_keyframe_idx = None
-        self.frame_count = 0
+        # self.frame_buffer = deque(maxlen=30)  # Keep last 30 frames
+        # self.last_keyframe_idx = None
+        # self.frame_count = 0
         
         logger.info(f"Created stream: {stream_id}")
     
@@ -71,30 +72,40 @@ class LiveStream:
         self.viewers.discard(handler)
         logger.info(f"Viewer disconnected from stream: {self.stream_id} (remaining: {len(self.viewers)})")
     
-    def add_frame(self, frame_data, is_keyframe):
-        """Add a frame to the buffer"""
-        self.frame_buffer.append((frame_data, is_keyframe))
+    # def add_frame(self, frame_data, is_keyframe):
+    #     """Add a frame to the buffer"""
+    #     self.frame_buffer.append((frame_data, is_keyframe))
         
-        if is_keyframe:
-            self.last_keyframe_idx = len(self.frame_buffer) - 1
+    #     if is_keyframe:
+    #         self.last_keyframe_idx = len(self.frame_buffer) - 1
         
-        self.frame_count += 1
+    #     self.frame_count += 1
     
-    def get_frames_from_keyframe(self):
-        """Get all frames from the last keyframe onwards"""
-        if self.last_keyframe_idx is None:
-            return list(self.frame_buffer)
+    # def get_frames_from_keyframe(self):
+    #     """Get all frames from the last keyframe onwards"""
+    #     if self.last_keyframe_idx is None:
+    #         return list(self.frame_buffer)
         
-        # Return frames from last keyframe
-        return list(self.frame_buffer)[self.last_keyframe_idx:]
+    #     # Return frames from last keyframe
+    #     return list(self.frame_buffer)[self.last_keyframe_idx:]
     
-    async def broadcast_frame(self, frame_data):
-        """Broadcast a frame to all viewers"""
+    # async def broadcast_frame(self, frame_data):
+    #     """Broadcast a frame to all viewers"""
+    #     if not self.viewers:
+    #         return
+        
+    #     # Send to all viewers in parallel
+    #     tasks = [viewer.send_frame(frame_data) for viewer in self.viewers]
+    #     await asyncio.gather(*tasks, return_exceptions=True)
+
+    # --- Thay đổi: broadcast_datagram ---
+    async def broadcast_datagram(self, datagram_data):
+        """Broadcast a datagram fragment to all viewers"""
         if not self.viewers:
             return
         
-        # Send to all viewers in parallel
-        tasks = [viewer.send_frame(frame_data) for viewer in self.viewers]
+        # Gửi datagram song song tới tất cả viewer
+        tasks = [viewer.send_datagram(datagram_data) for viewer in self.viewers]
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
@@ -104,6 +115,8 @@ class StreamManager:
     def __init__(self):
         self.streams = {}
         self.lock = asyncio.Lock()
+        ''' Đây là một khóa bất đồng bộ. Nó đảm bảo rằng chỉ có một tác vụ được phép đọc hoặc ghi vào self.streams 
+        tại một thời điểm (vì nhiều Publisher hoặc Viewer có thể cố gắng truy cập cùng một kênh cùng lúc). '''
     
     async def get_stream(self, stream_id, create=True):
         """Get or create a stream"""
@@ -158,39 +171,113 @@ class PublisherHandler:
             stream.publisher = None
             await stream_manager.remove_stream_if_empty(self.stream_id)
     
-    async def handle_stream_data(self, wt_stream_id, data, end_stream):
-        """Handle incoming frame data from publisher"""
-        # Buffer data from this stream
-        if wt_stream_id not in self.stream_buffers:
-            self.stream_buffers[wt_stream_id] = bytearray()
+    # async def handle_stream_data(self, wt_stream_id, data, end_stream):
+    #     """Handle incoming frame data from publisher"""
+    #     # Buffer data from this stream
+    #     if wt_stream_id not in self.stream_buffers:
+    #         self.stream_buffers[wt_stream_id] = bytearray()
         
-        self.stream_buffers[wt_stream_id].extend(data)
+    #     self.stream_buffers[wt_stream_id].extend(data)
         
-        # Process complete frame when stream ends
-        if end_stream:
-            frame_data = bytes(self.stream_buffers[wt_stream_id])
-            del self.stream_buffers[wt_stream_id]
+    #     # Process complete frame when stream ends
+    #     if end_stream:
+    #         frame_data = bytes(self.stream_buffers[wt_stream_id])
+    #         del self.stream_buffers[wt_stream_id]
             
+    #         stream = await stream_manager.get_stream(self.stream_id, create=False)
+    #         if not stream:
+    #             return
+            
+    #         # Parse frame header
+    #         if len(frame_data) < 16:
+    #             logger.warning(f"Received invalid frame data (too short: {len(frame_data)} bytes)")
+    #             return
+            
+    #         # Extract keyframe flag (byte 12)
+    #         is_keyframe = (frame_data[12] == 1)
+            
+    #         # Store frame in buffer
+    #         stream.add_frame(frame_data, is_keyframe)
+            
+    #         # Broadcast to viewers
+    #         await stream.broadcast_frame(frame_data)
+            
+    #         if stream.frame_count % 30 == 0:  # Log every 30 frames
+    #             logger.info(f"Stream {self.stream_id}: {stream.frame_count} frames processed (keyframe: {is_keyframe})")
+
+    # --- Thay đổi: Xử lý Datagram ---
+    async def h3_event_received(self, event: H3Event):
+        """Handle incoming datagrams from publisher"""
+        if isinstance(event, DatagramReceived):
             stream = await stream_manager.get_stream(self.stream_id, create=False)
-            if not stream:
-                return
+            if stream:
+                # Chỉ chuyển tiếp (relay) datagram
+                await stream.broadcast_datagram(event.data)
+
+
+# class ViewerHandler:
+#     """Handles a viewer connection"""
+    
+#     def __init__(self, stream_id, session_id, http, protocol):
+#         self.stream_id = stream_id
+#         self.session_id = session_id  # WebTransport session ID (QUIC stream ID)
+#         self.http = http  # H3Connection
+#         self.protocol = protocol
+#         self.active = True
+        
+#     async def handle(self):
+#         """Handle viewer session"""
+#         # Get stream
+#         stream = await stream_manager.get_stream(self.stream_id, create=False)
+        
+#         if not stream:
+#             logger.warning(f"Stream not found: {self.stream_id}")
+#             return
+        
+#         # Add viewer
+#         stream.add_viewer(self)
+        
+#         # Send buffered frames from last keyframe
+#         buffered_frames = stream.get_frames_from_keyframe()
+#         logger.info(f"Sending {len(buffered_frames)} buffered frames to viewer")
+#         for idx, (frame_data, is_keyframe) in enumerate(buffered_frames):
+#             await self.send_frame(frame_data)
+#             logger.info(f"Sent buffered frame {idx+1}/{len(buffered_frames)} (keyframe: {is_keyframe}, size: {len(frame_data)})")
+#             # Small delay to avoid overwhelming the connection
+#             await asyncio.sleep(0.01)
+        
+#         try:
+#             # Keep connection alive
+#             while self.active:
+#                 await asyncio.sleep(1)
+                
+#         except asyncio.CancelledError:
+#             logger.info(f"Viewer disconnected from stream: {self.stream_id}")
+#         finally:
+#             # Cleanup
+#             stream.remove_viewer(self)
+#             await stream_manager.remove_stream_if_empty(self.stream_id)
+    
+#     async def send_frame(self, frame_data):
+#         """Send a frame to this viewer"""
+#         if not self.active:
+#             return
+        
+#         try:
+#             # Create unidirectional WebTransport stream
+#             stream_id = self.http.create_webtransport_stream(
+#                 self.session_id, is_unidirectional=True
+#             )
             
-            # Parse frame header
-            if len(frame_data) < 16:
-                logger.warning(f"Received invalid frame data (too short: {len(frame_data)} bytes)")
-                return
+#             # Send frame data
+#             self.protocol._quic.send_stream_data(stream_id, frame_data, end_stream=True)
+#             self.protocol.transmit()
             
-            # Extract keyframe flag (byte 12)
-            is_keyframe = (frame_data[12] == 1)
+#             logger.debug(f"Sent frame to viewer (stream: {self.stream_id}, size: {len(frame_data)} bytes)")
             
-            # Store frame in buffer
-            stream.add_frame(frame_data, is_keyframe)
-            
-            # Broadcast to viewers
-            await stream.broadcast_frame(frame_data)
-            
-            if stream.frame_count % 30 == 0:  # Log every 30 frames
-                logger.info(f"Stream {self.stream_id}: {stream.frame_count} frames processed (keyframe: {is_keyframe})")
+#         except Exception as e:
+#             logger.error(f"Error sending frame to viewer: {e}")
+#             self.active = False
 
 
 class ViewerHandler:
@@ -198,63 +285,51 @@ class ViewerHandler:
     
     def __init__(self, stream_id, session_id, http, protocol):
         self.stream_id = stream_id
-        self.session_id = session_id  # WebTransport session ID (QUIC stream ID)
-        self.http = http  # H3Connection
+        self.session_id = session_id
+        self.http = http
         self.protocol = protocol
         self.active = True
         
     async def handle(self):
         """Handle viewer session"""
-        # Get stream
         stream = await stream_manager.get_stream(self.stream_id, create=False)
         
         if not stream:
             logger.warning(f"Stream not found: {self.stream_id}")
             return
         
-        # Add viewer
         stream.add_viewer(self)
         
-        # Send buffered frames from last keyframe
-        buffered_frames = stream.get_frames_from_keyframe()
-        logger.info(f"Sending {len(buffered_frames)} buffered frames to viewer")
-        for idx, (frame_data, is_keyframe) in enumerate(buffered_frames):
-            await self.send_frame(frame_data)
-            logger.info(f"Sent buffered frame {idx+1}/{len(buffered_frames)} (keyframe: {is_keyframe}, size: {len(frame_data)})")
-            # Small delay to avoid overwhelming the connection
-            await asyncio.sleep(0.01)
+        # --- Bỏ logic Gửi Frame đệm ---
+        # Người xem mới sẽ phải chờ Keyframe tiếp theo
         
         try:
-            # Keep connection alive
+            # Giữ kết nối mở
             while self.active:
                 await asyncio.sleep(1)
-                
         except asyncio.CancelledError:
             logger.info(f"Viewer disconnected from stream: {self.stream_id}")
         finally:
             # Cleanup
-            stream.remove_viewer(self)
-            await stream_manager.remove_stream_if_empty(self.stream_id)
+            if stream:
+                stream.remove_viewer(self)
+                await stream_manager.remove_stream_if_empty(self.stream_id)
     
-    async def send_frame(self, frame_data):
-        """Send a frame to this viewer"""
+    # --- Thay đổi: send_datagram ---
+    async def send_datagram(self, datagram_data):
+        """Send a datagram fragment to this viewer"""
         if not self.active:
             return
         
         try:
-            # Create unidirectional WebTransport stream
-            stream_id = self.http.create_webtransport_stream(
-                self.session_id, is_unidirectional=True
+            # Gửi datagram qua session chính
+            self.http.send_datagram(
+                self.session_id,
+                datagram_data
             )
-            
-            # Send frame data
-            self.protocol._quic.send_stream_data(stream_id, frame_data, end_stream=True)
             self.protocol.transmit()
-            
-            logger.debug(f"Sent frame to viewer (stream: {self.stream_id}, size: {len(frame_data)} bytes)")
-            
         except Exception as e:
-            logger.error(f"Error sending frame to viewer: {e}")
+            logger.error(f"Error sending datagram to viewer: {e}")
             self.active = False
 
 
@@ -280,15 +355,84 @@ class LivestreamProtocol(QuicConnectionProtocol):
                     handler.active = False
         
         # Handle HTTP/3 events
+        # if self._http is not None:
+        #     for h3_event in self._http.handle_event(event):
+        #         self._h3_event_received(h3_event)
+
         if self._http is not None:
             for h3_event in self._http.handle_event(event):
-                self._h3_event_received(h3_event)
+                # Sử dụng asyncio.create_task để gọi hàm async
+                asyncio.create_task(self._h3_event_received(h3_event))
     
-    def _h3_event_received(self, event: H3Event):
+    # def _h3_event_received(self, event: H3Event):
+    #     """Handle HTTP/3 events"""
+        
+    #     if isinstance(event, HeadersReceived):
+    #         # Parse request path
+    #         headers = dict(event.headers)
+    #         path = headers.get(b':path', b'').decode('utf-8')
+    #         method = headers.get(b':method', b'').decode('utf-8')
+    #         protocol = headers.get(b':protocol', b'').decode('utf-8')
+            
+    #         logger.info(f"Received request: {method} {path} (protocol: {protocol})")
+            
+    #         # Check if it's a WebTransport CONNECT request
+    #         if method != 'CONNECT' or protocol != 'webtransport':
+    #             logger.warning(f"Invalid WebTransport request")
+    #             self._send_response(event.stream_id, 400, end_stream=True)
+    #             return
+            
+    #         # Route request
+    #         if path.startswith('/publish/'):
+    #             stream_id = path[9:]  # Remove '/publish/' prefix
+    #             handler = PublisherHandler(stream_id, event.stream_id, self._http, self)
+    #             self.handlers[event.stream_id] = handler
+    #             logger.info(f"Created PublisherHandler: stream_id={stream_id}, session_id={event.stream_id}")
+    #             self._send_response(event.stream_id, 200)  # Accept WebTransport session
+    #             asyncio.create_task(handler.handle())
+                
+    #         elif path.startswith('/watch/'):
+    #             stream_id = path[7:]  # Remove '/watch/' prefix
+    #             handler = ViewerHandler(stream_id, event.stream_id, self._http, self)
+    #             self.handlers[event.stream_id] = handler
+    #             logger.info(f"Created ViewerHandler: stream_id={stream_id}, session_id={event.stream_id}")
+    #             self._send_response(event.stream_id, 200)  # Accept WebTransport session
+    #             asyncio.create_task(handler.handle())
+                
+    #         else:
+    #             logger.warning(f"Unknown path: {path}")
+    #             self._send_response(event.stream_id, 404, end_stream=True)
+        
+    #     elif isinstance(event, WebTransportStreamDataReceived):
+    #         # Handle incoming stream data (frames from publisher)
+    #         logger.debug(f"Received WebTransport stream data: session={event.session_id}, stream={event.stream_id}, size={len(event.data)}, ended={event.stream_ended}")
+            
+    #         handler = self.handlers.get(event.session_id)
+            
+    #         if isinstance(handler, PublisherHandler):
+    #             asyncio.create_task(
+    #                 handler.handle_stream_data(event.stream_id, event.data, event.stream_ended)
+    #             )
+    #         else:
+    #             logger.warning(f"No publisher handler for session {event.session_id}")
+    
+    # def _send_response(self, stream_id: int, status_code: int, end_stream=False):
+    #     """Send HTTP response"""
+    #     headers = [
+    #         (b":status", str(status_code).encode()),
+    #     ]
+    #     if status_code == 200:
+    #         headers.append((b"sec-webtransport-http3-draft", b"draft02"))
+        
+    #     self._http.send_headers(stream_id=stream_id, headers=headers, end_stream=end_stream)
+    #     self.transmit()  # Ensure data is sent
+
+    # --- Thay đổi: Hàm này giờ là async ---
+    async def _h3_event_received(self, event: H3Event):
         """Handle HTTP/3 events"""
         
         if isinstance(event, HeadersReceived):
-            # Parse request path
+            # ... (Giữ nguyên logic HeadersReceived để tạo Publisher/Viewer Handlers) ...
             headers = dict(event.headers)
             path = headers.get(b':path', b'').decode('utf-8')
             method = headers.get(b':method', b'').decode('utf-8')
@@ -296,48 +440,48 @@ class LivestreamProtocol(QuicConnectionProtocol):
             
             logger.info(f"Received request: {method} {path} (protocol: {protocol})")
             
-            # Check if it's a WebTransport CONNECT request
             if method != 'CONNECT' or protocol != 'webtransport':
                 logger.warning(f"Invalid WebTransport request")
                 self._send_response(event.stream_id, 400, end_stream=True)
                 return
             
-            # Route request
             if path.startswith('/publish/'):
-                stream_id = path[9:]  # Remove '/publish/' prefix
+                stream_id = path[9:]
                 handler = PublisherHandler(stream_id, event.stream_id, self._http, self)
                 self.handlers[event.stream_id] = handler
                 logger.info(f"Created PublisherHandler: stream_id={stream_id}, session_id={event.stream_id}")
-                self._send_response(event.stream_id, 200)  # Accept WebTransport session
+                self._send_response(event.stream_id, 200)
                 asyncio.create_task(handler.handle())
                 
             elif path.startswith('/watch/'):
-                stream_id = path[7:]  # Remove '/watch/' prefix
+                stream_id = path[7:]
                 handler = ViewerHandler(stream_id, event.stream_id, self._http, self)
                 self.handlers[event.stream_id] = handler
                 logger.info(f"Created ViewerHandler: stream_id={stream_id}, session_id={event.stream_id}")
-                self._send_response(event.stream_id, 200)  # Accept WebTransport session
+                self._send_response(event.stream_id, 200)
                 asyncio.create_task(handler.handle())
                 
             else:
                 logger.warning(f"Unknown path: {path}")
                 self._send_response(event.stream_id, 404, end_stream=True)
-        
-        elif isinstance(event, WebTransportStreamDataReceived):
-            # Handle incoming stream data (frames from publisher)
-            logger.debug(f"Received WebTransport stream data: session={event.session_id}, stream={event.stream_id}, size={len(event.data)}, ended={event.stream_ended}")
-            
-            handler = self.handlers.get(event.session_id)
+
+        # --- Thay đổi: Xử lý Datagram ---
+        elif isinstance(event, DatagramReceived):
+            # handler = self.handlers.get(event.session_id)
+            handler = self.handlers.get(event.stream_id)
             
             if isinstance(handler, PublisherHandler):
-                asyncio.create_task(
-                    handler.handle_stream_data(event.stream_id, event.data, event.stream_ended)
-                )
+                # Chuyển datagram cho PublisherHandler (vì nó là async)
+                await handler.h3_event_received(event)
             else:
-                logger.warning(f"No publisher handler for session {event.session_id}")
+                logger.warning(f"Received datagram for non-publisher session {event.session_id}")
+        
+        # --- Bỏ logic WebTransportStreamDataReceived ---
+        # elif isinstance(event, WebTransportStreamDataReceived):
+        #      logger.warning(f"Received unexpected Stream data on session {event.session_id}")
     
     def _send_response(self, stream_id: int, status_code: int, end_stream=False):
-        """Send HTTP response"""
+        # ... (Giữ nguyên hàm _send_response) ...
         headers = [
             (b":status", str(status_code).encode()),
         ]
@@ -345,7 +489,7 @@ class LivestreamProtocol(QuicConnectionProtocol):
             headers.append((b"sec-webtransport-http3-draft", b"draft02"))
         
         self._http.send_headers(stream_id=stream_id, headers=headers, end_stream=end_stream)
-        self.transmit()  # Ensure data is sent
+        self.transmit()
 
 
 def load_certificate_from_echo(cert_file='../echo/cert.crt', key_file='../echo/key.key'):
@@ -416,15 +560,16 @@ async def main(host='127.0.0.1', port=4433):
     configuration.load_cert_chain(certfile=cert_data['cert_path'], keyfile=cert_data['key_path'])
     
     # Start server
-    logger.info(f"\n🚀 Server starting on {host}:{port}")
-    logger.info(f"📜 SPKI Hash: {cert_data['spki_hash_hex']}")
-    logger.info(f"\n📌 Launch Chrome with:")
+    logger.info(f"\n Server starting on {host}:{port}")
+    logger.info(f" SPKI Hash: {cert_data['spki_hash_hex']}")
+    logger.info(f"\n Launch Chrome with:")
     logger.info(f'   --origin-to-force-quic-on={host}:{port} \\')
     logger.info(f'   --ignore-certificate-errors-spki-list={cert_data["spki_hash_hex"]}\n')
-    logger.info(f"📺 Publisher URL: https://{host}:{port}/publish/YOUR_STREAM_ID")
-    logger.info(f"👀 Viewer URL: https://{host}:{port}/watch/YOUR_STREAM_ID")
+    logger.info(f"Publisher URL: https://{host}:{port}/publish/YOUR_STREAM_ID")
+    logger.info(f"Viewer URL: https://{host}:{port}/watch/YOUR_STREAM_ID")
     logger.info("=" * 70)
     
+    #aioquic.asyncio.serve()
     await serve(
         host=host,
         port=port,
@@ -446,4 +591,4 @@ if __name__ == '__main__':
     try:
         asyncio.run(main(host=args.host, port=args.port))
     except KeyboardInterrupt:
-        logger.info("\n👋 Server stopped by user")
+        logger.info("\n Server stopped by user")
