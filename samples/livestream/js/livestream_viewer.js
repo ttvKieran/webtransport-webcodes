@@ -23,9 +23,32 @@ class LivestreamViewer {
             latencySum: 0,
             latencyCount: 0
         };
+
+        // Packet tracking for datagrams
+        this.stats.lastSeq = null;
+        this.stats.packetsLost = 0;
+        this.stats.totalPackets = 0;
         
         this.initUI();
         this.checkUrlParams();
+
+        // Reassembly buffers for fragmented frames: key = `${sessionId}:${seq}`
+        this.reassembly = new Map();
+
+        // Periodically clean up stale reassembly entries
+        setInterval(() => {
+            const now = Date.now();
+            for (const [key, entry] of this.reassembly.entries()) {
+                if (now - entry.ts > 5000) { // 5s timeout
+                    this.reassembly.delete(key);
+                    console.warn(`Reassembly entry expired: ${key}`);
+                }
+            }
+        }, 2000);
+
+        // Resend request cooldown to avoid spamming server
+        this._lastResendRequestTs = 0;
+        this._resendCooldownMs = 5000; // 5 seconds
     }
     
     initUI() {
@@ -48,6 +71,7 @@ class LivestreamViewer {
             latencyDisplay: document.getElementById('latency'),
             bufferSizeDisplay: document.getElementById('buffer-size'),
             droppedFramesDisplay: document.getElementById('dropped-frames'),
+            packetLossDisplay: document.getElementById('packet-loss'),
             
             // Quality indicators
             qualityBars: [
@@ -228,17 +252,108 @@ class LivestreamViewer {
 
     async processFrameData(data) {
         try {
-            if (data.byteLength < 16) {
+            // New header layout (24 bytes):
+            // [session_id:uint32][seq:uint32][timestamp:uint64][duration:uint32][flags:uint8][pad:3]
+            const HEADER_LEN = 24;
+            if (data.byteLength < HEADER_LEN) {
                 console.error(`Frame too short: ${data.byteLength} bytes`);
                 return;
             }
-            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
-            const timestamp = Number(view.getBigUint64(0, true)); // microseconds since epoch
-            const duration = view.getUint32(8, true);
-            const isKey = view.getUint8(12) === 1;
-            const size = view.getUint32(13, true) & 0xFFFFFF;
 
-            const frameData = data.slice(16);
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const sessionId = view.getUint32(0, true);
+            const seq = view.getUint32(4, true);
+            const timestamp = Number(view.getBigUint64(8, true)); // microseconds since epoch
+            const duration = view.getUint32(16, true);
+            const flags = view.getUint8(20);
+            const isKey = (flags & 0x01) === 1;
+            const isFragmented = (flags & 0x80) !== 0;
+
+            // If fragmented, read frag header (frag_index, frag_count) at HEADER_LEN
+            let frameData = null;
+            if (isFragmented) {
+                if (data.byteLength < HEADER_LEN + 4) {
+                    console.warn('Fragment too short');
+                    return;
+                }
+                const fv = new DataView(data.buffer, data.byteOffset + HEADER_LEN, 4);
+                const fragIndex = fv.getUint16(0, true);
+                const fragCount = fv.getUint16(2, true);
+
+                const payload = data.slice(HEADER_LEN + 4);
+
+                const key = `${sessionId}:${seq}`;
+                let entry = this.reassembly.get(key);
+                if (!entry) {
+                    entry = {
+                        frags: new Array(fragCount),
+                        received: 0,
+                        fragCount: fragCount,
+                        ts: Date.now()
+                    };
+                    this.reassembly.set(key, entry);
+                }
+
+                if (!entry.frags[fragIndex]) {
+                    entry.frags[fragIndex] = payload;
+                    entry.received++;
+                }
+
+                if (entry.received === entry.fragCount) {
+                    // Reassemble
+                    let total = 0;
+                    for (let i = 0; i < entry.fragCount; i++) total += entry.frags[i].length;
+                    const assembledPayload = new Uint8Array(total);
+                    let off = 0;
+                    for (let i = 0; i < entry.fragCount; i++) {
+                        assembledPayload.set(entry.frags[i], off);
+                        off += entry.frags[i].length;
+                    }
+                    frameData = assembledPayload;
+                    this.reassembly.delete(key);
+                } else {
+                    // Wait for more fragments
+                    return;
+                }
+            } else {
+                frameData = data.slice(HEADER_LEN);
+            }
+
+            // Packet loss accounting
+            try {
+                if (this.stats.lastSeq !== null) {
+                    const expected = (this.stats.lastSeq + 1) >>> 0;
+                    if (seq !== expected) {
+                        // Simple detection: if seq > lastSeq, count missing frames
+                        if (seq > this.stats.lastSeq) {
+                            const lost = seq - expected;
+                            if (lost > 0) {
+                                this.stats.packetsLost += lost;
+                                console.warn(`Detected packet loss: ${lost} packets (seq ${this.stats.lastSeq} -> ${seq})`);
+                            }
+                        } else {
+                            // wrap-around or re-order; for now, log
+                            console.warn(`Sequence jump or wrap detected: last=${this.stats.lastSeq}, now=${seq}`);
+                        }
+                    }
+                }
+                this.stats.lastSeq = seq;
+                this.stats.totalPackets++;
+                // Save current session id observed
+                this.currentSessionId = sessionId;
+
+                // If packet loss percentage exceeds threshold, request keyframe resend (debounced)
+                const lossPct = this.stats.totalPackets > 0 ? (this.stats.packetsLost / this.stats.totalPackets) * 100 : 0;
+                if (this.stats.packetsLost > 0 && lossPct >= 5) {
+                    const now = Date.now();
+                    if (now - this._lastResendRequestTs > this._resendCooldownMs) {
+                        this._lastResendRequestTs = now;
+                        this.requestKeyframeResend();
+                    }
+                }
+            } catch (e) {
+                console.warn('Packet loss accounting error', e);
+            }
 
             // Sanity-check timestamp: convert to ms
             const nowMs = Date.now();
@@ -279,6 +394,28 @@ class LivestreamViewer {
 
         } catch (error) {
             console.error('processFrameData error:', error);
+        }
+    }
+
+    async requestKeyframeResend() {
+        try {
+            if (!this.transport || this.transport.state === 'closed' || this.transport.state === 'failed') return;
+            if (!this.currentSessionId) {
+                console.warn('No session id known, cannot request keyframe resend');
+                return;
+            }
+
+            const msg = JSON.stringify({ type: 'resend_keyframe', session_key: this.currentSessionId });
+
+            // Send as a unidirectional stream to server (viewer -> server control)
+            const stream = await this.transport.createUnidirectionalStream();
+            const writer = stream.getWriter();
+            await writer.write(new TextEncoder().encode(msg));
+            await writer.close();
+
+            this.log('Requested keyframe resend from server', 'info');
+        } catch (e) {
+            console.warn('Failed to request keyframe resend', e);
         }
     }
     
@@ -469,11 +606,17 @@ class LivestreamViewer {
             this.stats.latencyCount = 0;
         }
         
-        // Update buffer size
+    // Update buffer size
         this.elements.bufferSizeDisplay.textContent = this.frameBuffer.length;
         
         // Update dropped frames
         this.elements.droppedFramesDisplay.textContent = this.stats.droppedFrames.toLocaleString();
+
+        // Update packet loss display (if element exists)
+        if (this.elements.packetLossDisplay) {
+            const lossPct = this.stats.totalPackets > 0 ? Math.round((this.stats.packetsLost / this.stats.totalPackets) * 100) : 0;
+            this.elements.packetLossDisplay.textContent = `${this.stats.packetsLost} (${lossPct}%)`;
+        }
     }
     
     updateQualityIndicator(fps) {

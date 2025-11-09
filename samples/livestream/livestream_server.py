@@ -4,6 +4,7 @@ import argparse
 import logging
 import sys
 from collections import defaultdict, deque
+import zlib
 from urllib.parse import urlparse
 
 from aioquic.asyncio import serve
@@ -76,6 +77,15 @@ class LiveStream:
         
         # Return frames from last keyframe
         return list(self.frame_buffer)[self.last_keyframe_idx:]
+
+    def get_last_keyframe(self):
+        """Return the most recent keyframe (frame_data, is_keyframe) or None if none."""
+        if self.last_keyframe_idx is None:
+            return None
+        try:
+            return list(self.frame_buffer)[self.last_keyframe_idx]
+        except Exception:
+            return None
     
     async def broadcast_frame(self, frame_data):
         """Broadcast a frame to all viewers"""
@@ -100,6 +110,8 @@ class StreamManager:
     def __init__(self):
         self.streams = {}
         self.lock = asyncio.Lock()
+        # session_key (uint32) -> PublisherHandler
+        self.session_map = {}
     
     async def get_stream(self, stream_id, create=True):
         """Get or create a stream"""
@@ -117,6 +129,25 @@ class StreamManager:
                 del self.streams[stream_id]
                 logger.info(f"Removed empty stream: {stream_id}")
 
+    def register_session(self, session_key, handler):
+        """Register a mapping from session_key (uint32) -> publisher handler"""
+        try:
+            self.session_map[session_key] = handler
+            logger.info(f"Registered session_key for stream {handler.stream_id}: 0x{session_key:08x}")
+        except Exception as e:
+            logger.error(f"Error registering session: {e}")
+
+    def unregister_session(self, session_key):
+        try:
+            if session_key in self.session_map:
+                del self.session_map[session_key]
+                logger.info(f"Unregistered session_key: 0x{session_key:08x}")
+        except Exception as e:
+            logger.error(f"Error unregistering session: {e}")
+
+    def get_publisher_by_session(self, session_key):
+        return self.session_map.get(session_key)
+
 
 # Global stream manager
 stream_manager = StreamManager()
@@ -132,12 +163,20 @@ class PublisherHandler:
         self.protocol = protocol
         self.stream_buffers = {}  # stream_id -> bytearray buffer
         self.active = True
+        # Expected 32-bit session key derived from stream_id (same hash publisher will compute)
+        try:
+            self.expected_session_key = zlib.crc32(self.stream_id.encode()) & 0xffffffff
+        except Exception:
+            self.expected_session_key = None
         
     async def handle(self):
         """Handle publisher session"""
         # Register as publisher
         stream = await stream_manager.get_stream(self.stream_id)
         stream.set_publisher(self)
+        # Register mapping session_key -> this handler so QUIC datagrams can be routed
+        if self.expected_session_key is not None:
+            stream_manager.register_session(self.expected_session_key, self)
         
         logger.info(f"Publisher handler started for stream: {self.stream_id}")
         
@@ -152,6 +191,12 @@ class PublisherHandler:
         finally:
             # Cleanup
             stream.publisher = None
+            # Unregister session mapping if present
+            try:
+                if getattr(self, 'expected_session_key', None) is not None:
+                    stream_manager.unregister_session(self.expected_session_key)
+            except Exception:
+                pass
             await stream_manager.remove_stream_if_empty(self.stream_id)
     
     async def handle_stream_data(self, wt_stream_id, data, end_stream):
@@ -171,13 +216,14 @@ class PublisherHandler:
             if not stream:
                 return
             
-            # Parse frame header
-            if len(frame_data) < 16:
+            # New header layout expected from publisher (24 bytes):
+            # [session_key:uint32][seq:uint32][timestamp:uint64][duration:uint32][flags:uint8][pad:3]
+            if len(frame_data) < 24:
                 logger.warning(f"Received invalid frame data (too short: {len(frame_data)} bytes)")
                 return
-            
-            # Extract keyframe flag (byte 12)
-            is_keyframe = (frame_data[12] == 1)
+
+            # Extract keyframe flag at offset 20
+            is_keyframe = (frame_data[20] == 1)
             
             # Store frame in buffer
             stream.add_frame(frame_data, is_keyframe)
@@ -195,15 +241,23 @@ class PublisherHandler:
             if not stream:
                 return
 
-            # Expect datagram to be full frame with header (16 bytes) + payload
-            if len(data) < 16:
+            # Expect datagram to be full frame with new header (24 bytes) + payload
+            if len(data) < 24:
                 logger.warning(f"Received invalid datagram (too short: {len(data)} bytes)")
                 return
 
-            # Extract keyframe flag at byte 12
-            is_keyframe = (data[12] == 1)
+            # Extract keyframe flag at offset 20
+            is_keyframe = (data[20] == 1)
 
-            # Store frame in buffer
+            # Optionally verify session key in datagram matches expected
+            try:
+                datagram_session_key = int.from_bytes(data[0:4], 'little')
+                if self.expected_session_key is not None and datagram_session_key != self.expected_session_key:
+                    logger.warning(f"Datagram session key mismatch: got=0x{datagram_session_key:08x}, expected=0x{self.expected_session_key:08x}")
+            except Exception:
+                pass
+
+            # Store frame in buffer (keep header so viewers can parse)
             stream.add_frame(data, is_keyframe)
 
             # Broadcast to viewers using datagrams
@@ -258,6 +312,44 @@ class ViewerHandler:
             # Cleanup
             stream.remove_viewer(self)
             await stream_manager.remove_stream_if_empty(self.stream_id)
+
+    async def handle_control_stream(self, wt_stream_id, data, end_stream):
+        """Handle a control message from the viewer (JSON over a unidirectional stream).
+
+        Expected message example:
+          {"type":"resend_keyframe","session_key":12345678}
+        """
+        if not data:
+            return
+        try:
+            text = data.decode('utf-8') if isinstance(data, (bytes, bytearray)) else str(data)
+            import json
+            msg = json.loads(text)
+        except Exception as e:
+            logger.warning(f"Invalid control message from viewer: {e}")
+            return
+
+        try:
+            if msg.get('type') == 'resend_keyframe':
+                # Find stream and last keyframe
+                stream = await stream_manager.get_stream(self.stream_id, create=False)
+                if not stream:
+                    logger.warning(f"Resend requested but stream not found: {self.stream_id}")
+                    return
+
+                entry = stream.get_last_keyframe()
+                if not entry:
+                    logger.info(f"No keyframe available to resend for stream {self.stream_id}")
+                    return
+
+                frame_data, is_key = entry
+                # Send reliably via stream to the requesting viewer
+                await self.send_frame(frame_data)
+                logger.info(f"Resent keyframe to viewer for stream {self.stream_id} (size={len(frame_data)})")
+            else:
+                logger.info(f"Unknown control message type: {msg.get('type')}")
+        except Exception as e:
+            logger.error(f"Error handling control message: {e}")
     
     async def send_frame(self, frame_data):
         """Send a frame to this viewer"""
@@ -320,10 +412,20 @@ class LivestreamProtocol(QuicConnectionProtocol):
         # Handle QUIC datagram frames (route to publisher handler if present)
         if isinstance(event, DatagramFrameReceived):
             logger.debug(f"Received QUIC datagram on connection: size={len(event.data)}")
-            # Best-effort: find a PublisherHandler on this connection and route datagram
+            # Try to parse a 32-bit session_key from the start of datagram (little-endian)
+            try:
+                if len(event.data) >= 4:
+                    session_key = int.from_bytes(event.data[0:4], 'little')
+                    publisher = stream_manager.get_publisher_by_session(session_key)
+                    if publisher:
+                        asyncio.create_task(publisher.handle_datagram(event.data))
+                        return
+            except Exception as e:
+                logger.debug(f"Datagram parse error: {e}")
+
+            # Fallback: find a PublisherHandler on this connection and route datagram (best-effort)
             for handler in list(self.handlers.values()):
                 if isinstance(handler, PublisherHandler):
-                    # route datagram to the publisher handler
                     try:
                         asyncio.create_task(handler.handle_datagram(event.data))
                     except Exception as e:
@@ -385,7 +487,16 @@ class LivestreamProtocol(QuicConnectionProtocol):
                     handler.handle_stream_data(event.stream_id, event.data, event.stream_ended)
                 )
             else:
-                logger.warning(f"No publisher handler for session {event.session_id}")
+                # If this stream belongs to a viewer, interpret it as a control stream
+                if isinstance(handler, ViewerHandler):
+                    try:
+                        asyncio.create_task(
+                            handler.handle_control_stream(event.stream_id, event.data, event.stream_ended)
+                        )
+                    except Exception as e:
+                        logger.error(f"Error scheduling viewer control handler: {e}")
+                else:
+                    logger.warning(f"No publisher handler for session {event.session_id}")
         
     
     def _send_response(self, stream_id: int, status_code: int, end_stream=False):

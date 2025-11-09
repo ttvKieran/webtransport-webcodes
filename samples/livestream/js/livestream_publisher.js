@@ -26,6 +26,10 @@ class LivestreamPublisher {
             height: 360
         };
         
+        // session id (32-bit) derived from stream name
+        this.sessionId = 0;
+        this.seq = 0; // per-session sequence number (wraps at 2^32)
+
         this.initUI();
     }
     
@@ -101,6 +105,18 @@ class LivestreamPublisher {
             
             // Connect to WebTransport server
             await this.connectTransport();
+
+            // Derive a 32-bit session id from the stream path (simple hash)
+            try {
+                const serverUrl = new URL(this.elements.serverUrl.value);
+                const path = serverUrl.pathname; // e.g. /publish/mystream
+                const streamId = path.split('/').pop() || 'stream';
+                this.sessionId = this.crc32(streamId);
+                this.seq = 0;
+                this.log(`Derived sessionId: 0x${this.sessionId.toString(16)}`, 'info');
+            } catch (e) {
+                this.sessionId = Math.floor(Math.random() * 0xffffffff);
+            }
             
             // Initialize video encoder
             await this.initEncoder();
@@ -126,6 +142,30 @@ class LivestreamPublisher {
             this.elements.startBtn.disabled = false;
             this.cleanup();
         }
+    }
+
+    // CRC32 implementation to match server zlib.crc32
+    crc32(str) {
+        if (!this._crcTable) {
+            this._crcTable = new Uint32Array(256);
+            for (let n = 0; n < 256; n++) {
+                let c = n;
+                for (let k = 0; k < 8; k++) {
+                    if (c & 1) {
+                        c = 0xEDB88320 ^ (c >>> 1);
+                    } else {
+                        c = c >>> 1;
+                    }
+                }
+                this._crcTable[n] = c >>> 0;
+            }
+        }
+        let crc = 0xFFFFFFFF >>> 0;
+        for (let i = 0; i < str.length; i++) {
+            const code = str.charCodeAt(i);
+            crc = (crc >>> 8) ^ this._crcTable[(crc ^ code) & 0xFF];
+        }
+        return (crc ^ 0xFFFFFFFF) >>> 0;
     }
     
     async stop() {
@@ -290,29 +330,167 @@ class LivestreamPublisher {
         try {
             console.log(`Encoding chunk: type=${chunk.type}, timestamp=${chunk.timestamp}, size=${chunk.byteLength}`);
             
-            // Serialize encoded chunk
-            const data = new Uint8Array(chunk.byteLength + 16);
-            const view = new DataView(data.buffer);
+            // Serialize encoded chunk with extended header and fragment if needed
+            // Base header layout (24 bytes): [session_id:uint32][seq:uint32][timestamp:uint64][duration:uint32][flags:uint8][pad:3]
+            const HEADER_LEN = 24;
+            const FRAG_HEADER_LEN = 4; // [frag_index:uint16][frag_count:uint16]
+            const MAX_DATAGRAM_SIZE = 65536; // match server
+
+            // Extract payload into a plain Uint8Array
+            const payload = new Uint8Array(chunk.byteLength);
+            chunk.copyTo(payload);
+
+            // Build base header buffer (without seq yet; seq will be set per-frame)
+            const baseHeader = new Uint8Array(HEADER_LEN);
+            const vh = new DataView(baseHeader.buffer);
+            vh.setUint32(0, this.sessionId >>> 0, true);
+            // leave seq at offset 4 to set later
+            vh.setBigUint64(8, BigInt(Date.now()) * 1000n, true);
+            vh.setUint32(16, chunk.duration || 0, true);
+            vh.setUint8(20, chunk.type === 'key' ? 1 : 0);
+
+            // If datagrams are supported try to fragment if frame too big
+            if (this.transport && this.transport.datagrams && this.transport.datagrams.send) {
+                // Calculate available payload per datagram when using fragment header
+                const maxPayloadPerDatagram = MAX_DATAGRAM_SIZE - HEADER_LEN - FRAG_HEADER_LEN;
+
+                if (payload.byteLength + HEADER_LEN <= MAX_DATAGRAM_SIZE) {
+                    // Single datagram fits
+                    vh.setUint32(4, this.seq >>> 0, true);
+                    const datagram = new Uint8Array(HEADER_LEN + payload.byteLength);
+                    datagram.set(baseHeader, 0);
+                    datagram.set(payload, HEADER_LEN);
+
+                    await this.sendDatagram(datagram);
+
+                    // increment seq after sending
+                    this.seq = (this.seq + 1) >>> 0;
+                    this.stats.framesSent++;
+                    this.stats.bytesSent += datagram.byteLength;
+                    console.log(`Frame sent as 1 datagram: ${datagram.byteLength} bytes (hdr ${HEADER_LEN})`);
+                } else {
+                    // Fragment into multiple datagrams
+                    const fragCount = Math.ceil(payload.byteLength / maxPayloadPerDatagram);
+                    // mark fragmentation in flags (high bit)
+                    const baseFlags = (chunk.type === 'key' ? 1 : 0);
+                    vh.setUint8(20, baseFlags | 0x80);
+                    let offset = 0;
+                    for (let i = 0; i < fragCount; i++) {
+                        const chunkSize = Math.min(maxPayloadPerDatagram, payload.byteLength - offset);
+                        const fragDatagram = new Uint8Array(HEADER_LEN + FRAG_HEADER_LEN + chunkSize);
+
+                        // session_id, seq, timestamp, duration, flags (baseHeader already has frag flag set)
+                        vh.setUint32(4, this.seq >>> 0, true);
+                        fragDatagram.set(baseHeader, 0);
+
+                        // fragment header
+                        const fv = new DataView(fragDatagram.buffer, HEADER_LEN, FRAG_HEADER_LEN);
+                        fv.setUint16(0, i, true);
+                        fv.setUint16(2, fragCount, true);
+
+                        // copy payload slice
+                        fragDatagram.set(payload.subarray(offset, offset + chunkSize), HEADER_LEN + FRAG_HEADER_LEN);
+
+                        await this.sendDatagram(fragDatagram);
+                        offset += chunkSize;
+                    }
+
+                    // increment seq after sending all fragments
+                    this.seq = (this.seq + 1) >>> 0;
+                    this.stats.framesSent++;
+                    // total bytes = fragCount * (HEADER + FRAG_HEADER) + payload
+                    this.stats.bytesSent += fragCount * (HEADER_LEN + FRAG_HEADER_LEN) + payload.byteLength;
+                    console.log(`Frame sent as ${fragCount} datagrams (payload ${payload.byteLength})`);
+                }
+            } else {
+                // Fallback: send whole frame over a unidirectional stream (reliable)
+                const data = new Uint8Array(HEADER_LEN + payload.byteLength);
+                const view = new DataView(data.buffer);
+                // header
+                view.setUint32(0, this.sessionId >>> 0, true);
+                view.setUint32(4, this.seq >>> 0, true);
+                view.setBigUint64(8, BigInt(Date.now()) * 1000n, true);
+                view.setUint32(16, chunk.duration || 0, true);
+                view.setUint8(20, chunk.type === 'key' ? 1 : 0);
+                data.set(payload, HEADER_LEN);
+
+                await this.sendFrame(data);
+                this.seq = (this.seq + 1) >>> 0;
+                this.stats.framesSent++;
+                this.stats.bytesSent += data.byteLength;
+                console.log(`Frame sent over stream: ${data.byteLength} bytes`);
+            }
             
-            // Header: [timestamp(8), duration(4), type(1), size(3)]
-            // Use epoch ms converted to microseconds so viewer can compute latency reliably
-            const tsMicro = BigInt(Date.now()) * 1000n;
-            view.setBigUint64(0, tsMicro, true);
-            view.setUint32(8, chunk.duration || 0, true);
-            view.setUint8(12, chunk.type === 'key' ? 1 : 0);
-            view.setUint32(13, chunk.byteLength, true); // Only use 3 bytes in practice
-            
-            // Copy chunk data
-            chunk.copyTo(data.subarray(16));
-            
-            console.log(`Serialized frame: ${data.byteLength} bytes (header: 16, payload: ${chunk.byteLength})`);
-            
-            // Send via WebTransport datagram when supported (faster, lower overhead)
-            await this.sendDatagram(data);
-            
-            this.stats.framesSent++;
-            this.stats.bytesSent += data.byteLength;
-            
+            // Optionally send a duplicate keyframe to improve resilience on lossy networks
+            if (chunk.type === 'key') {
+                try {
+                    // send duplicate with next seq (will increment seq after sending)
+                    const dupSeq = this.seq >>> 0; // current seq (already incremented after original send)
+                    const HEADER_LEN = 24;
+                    const FRAG_HEADER_LEN = 4;
+                    const MAX_DATAGRAM_SIZE = 65536;
+                    const maxPayloadPerDatagram = MAX_DATAGRAM_SIZE - HEADER_LEN - FRAG_HEADER_LEN;
+
+                    // reuse payload
+                    if (this.transport && this.transport.datagrams && this.transport.datagrams.send) {
+                        if (payload.byteLength + HEADER_LEN <= MAX_DATAGRAM_SIZE) {
+                            const datagram = new Uint8Array(HEADER_LEN + payload.byteLength);
+                            const dv = new DataView(datagram.buffer);
+                            dv.setUint32(0, this.sessionId >>> 0, true);
+                            dv.setUint32(4, dupSeq, true);
+                            dv.setBigUint64(8, BigInt(Date.now()) * 1000n, true);
+                            dv.setUint32(16, chunk.duration || 0, true);
+                            dv.setUint8(20, 1); // keyframe
+                            datagram.set(payload, HEADER_LEN);
+                            await this.sendDatagram(datagram);
+                        } else {
+                            const fragCount = Math.ceil(payload.byteLength / maxPayloadPerDatagram);
+                            let offset = 0;
+                            for (let i = 0; i < fragCount; i++) {
+                                const chunkSize = Math.min(maxPayloadPerDatagram, payload.byteLength - offset);
+                                const fragDatagram = new Uint8Array(HEADER_LEN + FRAG_HEADER_LEN + chunkSize);
+                                const dv = new DataView(fragDatagram.buffer);
+                                dv.setUint32(0, this.sessionId >>> 0, true);
+                                dv.setUint32(4, dupSeq, true);
+                                dv.setBigUint64(8, BigInt(Date.now()) * 1000n, true);
+                                dv.setUint32(16, chunk.duration || 0, true);
+                                dv.setUint8(20, 1 | 0x80);
+                                const fv = new DataView(fragDatagram.buffer, HEADER_LEN, FRAG_HEADER_LEN);
+                                fv.setUint16(0, i, true);
+                                fv.setUint16(2, fragCount, true);
+                                fragDatagram.set(payload.subarray(offset, offset + chunkSize), HEADER_LEN + FRAG_HEADER_LEN);
+                                await this.sendDatagram(fragDatagram);
+                                offset += chunkSize;
+                            }
+                        }
+                    } else {
+                        // stream fallback
+                        const data2 = new Uint8Array(HEADER_LEN + payload.byteLength);
+                        const dv = new DataView(data2.buffer);
+                        dv.setUint32(0, this.sessionId >>> 0, true);
+                        dv.setUint32(4, dupSeq, true);
+                        dv.setBigUint64(8, BigInt(Date.now()) * 1000n, true);
+                        dv.setUint32(16, chunk.duration || 0, true);
+                        dv.setUint8(20, 1);
+                        data2.set(payload, HEADER_LEN);
+                        await this.sendFrame(data2);
+                    }
+                    // account bytes for duplicate
+                    // approximate duplicate bytes as same as original fragments/datagram
+                    if (payload.byteLength + HEADER_LEN <= MAX_DATAGRAM_SIZE) {
+                        this.stats.bytesSent += (HEADER_LEN + payload.byteLength);
+                    } else {
+                        const fragCountDup = Math.ceil(payload.byteLength / Math.max(1, maxPayloadPerDatagram));
+                        this.stats.bytesSent += fragCountDup * (HEADER_LEN + FRAG_HEADER_LEN) + payload.byteLength;
+                    }
+                    // after duplicate send, advance seq
+                    this.seq = (this.seq + 1) >>> 0;
+                    console.log('Duplicate keyframe sent to improve resilience');
+                } catch (e) {
+                    console.warn('Failed to send duplicate keyframe', e);
+                }
+            }
+
             console.log(`Frame sent successfully! Total frames: ${this.stats.framesSent}`);
             
         } catch (error) {
