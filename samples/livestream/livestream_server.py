@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""
-WebTransport Livestream Server
-Simple multi-user livestream application using WebTransport over HTTP/3.
-
-Architecture:
-- Publisher connects to /publish/{stream_id}
-- Viewers connect to /watch/{stream_id}
-- Each stream has 1 publisher, multiple viewers
-- Frames are buffered (30 frames) and broadcast to all viewers
-"""
 
 import asyncio
 import argparse
@@ -28,7 +17,7 @@ from aioquic.h3.events import (
     DataReceived,
     WebTransportStreamDataReceived,
 )
-from aioquic.quic.events import QuicEvent, ProtocolNegotiated, StreamReset
+from aioquic.quic.events import QuicEvent, ProtocolNegotiated, StreamReset, DatagramFrameReceived
 
 
 # Configure logging
@@ -92,9 +81,16 @@ class LiveStream:
         """Broadcast a frame to all viewers"""
         if not self.viewers:
             return
-        
-        # Send to all viewers in parallel
+        # Send to all viewers in parallel (stream-based)
         tasks = [viewer.send_frame(frame_data) for viewer in self.viewers]
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def broadcast_datagram(self, data):
+        """Broadcast a datagram to all viewers"""
+        if not self.viewers:
+            return
+
+        tasks = [viewer.send_datagram(data) for viewer in self.viewers]
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
@@ -186,11 +182,38 @@ class PublisherHandler:
             # Store frame in buffer
             stream.add_frame(frame_data, is_keyframe)
             
-            # Broadcast to viewers
+            # Broadcast to viewers (stream)
             await stream.broadcast_frame(frame_data)
             
             if stream.frame_count % 30 == 0:  # Log every 30 frames
                 logger.info(f"Stream {self.stream_id}: {stream.frame_count} frames processed (keyframe: {is_keyframe})")
+
+    async def handle_datagram(self, data):
+        """Handle a single datagram containing one encoded frame (atomic)"""
+        try:
+            stream = await stream_manager.get_stream(self.stream_id, create=False)
+            if not stream:
+                return
+
+            # Expect datagram to be full frame with header (16 bytes) + payload
+            if len(data) < 16:
+                logger.warning(f"Received invalid datagram (too short: {len(data)} bytes)")
+                return
+
+            # Extract keyframe flag at byte 12
+            is_keyframe = (data[12] == 1)
+
+            # Store frame in buffer
+            stream.add_frame(data, is_keyframe)
+
+            # Broadcast to viewers using datagrams
+            await stream.broadcast_datagram(data)
+
+            if stream.frame_count % 30 == 0:
+                logger.info(f"Stream {self.stream_id}: {stream.frame_count} frames processed (datagram keyframe: {is_keyframe})")
+
+        except Exception as e:
+            logger.error(f"Error handling datagram from publisher: {e}")
 
 
 class ViewerHandler:
@@ -257,6 +280,21 @@ class ViewerHandler:
             logger.error(f"Error sending frame to viewer: {e}")
             self.active = False
 
+    async def send_datagram(self, data):
+        """Send a datagram to this viewer (if supported)"""
+        if not self.active:
+            return
+
+        try:
+            # Use QUIC datagram frame on this connection
+            # aioquic exposes low-level API to send datagram frames
+            self.protocol._quic.send_datagram_frame(data)
+            self.protocol.transmit()
+            logger.debug(f"Sent datagram to viewer (stream: {self.stream_id}, size: {len(data)} bytes)")
+        except Exception as e:
+            logger.error(f"Error sending datagram to viewer: {e}")
+            self.active = False
+
 
 class LivestreamProtocol(QuicConnectionProtocol):
     """WebTransport protocol handler"""
@@ -279,6 +317,19 @@ class LivestreamProtocol(QuicConnectionProtocol):
                 if hasattr(handler, 'active'):
                     handler.active = False
         
+        # Handle QUIC datagram frames (route to publisher handler if present)
+        if isinstance(event, DatagramFrameReceived):
+            logger.debug(f"Received QUIC datagram on connection: size={len(event.data)}")
+            # Best-effort: find a PublisherHandler on this connection and route datagram
+            for handler in list(self.handlers.values()):
+                if isinstance(handler, PublisherHandler):
+                    # route datagram to the publisher handler
+                    try:
+                        asyncio.create_task(handler.handle_datagram(event.data))
+                    except Exception as e:
+                        logger.error(f"Error scheduling datagram handler: {e}")
+                    break
+
         # Handle HTTP/3 events
         if self._http is not None:
             for h3_event in self._http.handle_event(event):
@@ -335,6 +386,7 @@ class LivestreamProtocol(QuicConnectionProtocol):
                 )
             else:
                 logger.warning(f"No publisher handler for session {event.session_id}")
+        
     
     def _send_response(self, stream_id: int, status_code: int, end_stream=False):
         """Send HTTP response"""

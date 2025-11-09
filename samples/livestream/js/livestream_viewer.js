@@ -138,9 +138,10 @@ class LivestreamViewer {
         
         this.transport = new WebTransport(url);
         
-        // Setup stream reader IMMEDIATELY (before waiting for ready)
-        console.log('Setting up incoming stream reader...');
-        this.setupStreamReader();
+    // Setup datagram reader (preferred) and stream reader as fallback
+    console.log('Setting up incoming datagram + stream readers...');
+    this.setupDatagramReader();
+    this.setupStreamReader();
         
         await this.transport.ready;
         this.log('WebTransport connected!', 'success');
@@ -190,6 +191,96 @@ class LivestreamViewer {
         
         this.log('Stream reader setup complete', 'success');
     }
+
+    setupDatagramReader() {
+        if (!this.transport || !this.transport.datagrams || !this.transport.datagrams.readable) {
+            this.log('Datagrams not supported by this WebTransport implementation - streams will be used as fallback', 'info');
+            return;
+        }
+
+        const reader = this.transport.datagrams.readable.getReader();
+
+        (async () => {
+            this.log('Datagram reader loop started', 'info');
+            while (true) {
+                try {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+
+                    if (!value) continue;
+                    // value is a Uint8Array
+                    console.log(`Received datagram: ${value.byteLength} bytes`);
+                    this.stats.bytesReceived += value.byteLength;
+                    // Process datagram frame (header + payload)
+                    await this.processFrameData(value);
+
+                } catch (error) {
+                    console.error('Datagram reader error:', error);
+                    break;
+                }
+            }
+
+            this.log('Datagram reader loop exited', 'info');
+        })();
+
+        this.log('Datagram reader setup complete', 'success');
+    }
+
+    async processFrameData(data) {
+        try {
+            if (data.byteLength < 16) {
+                console.error(`Frame too short: ${data.byteLength} bytes`);
+                return;
+            }
+            const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+            const timestamp = Number(view.getBigUint64(0, true)); // microseconds since epoch
+            const duration = view.getUint32(8, true);
+            const isKey = view.getUint8(12) === 1;
+            const size = view.getUint32(13, true) & 0xFFFFFF;
+
+            const frameData = data.slice(16);
+
+            // Sanity-check timestamp: convert to ms
+            const nowMs = Date.now();
+            const tsMs = Math.round(timestamp / 1000);
+            if (tsMs > nowMs + 60000) {
+                console.warn(`Frame timestamp too far in future (${tsMs} > ${nowMs}), skipping`);
+                return;
+            }
+
+            // Create EncodedVideoChunk
+            const chunk = new EncodedVideoChunk({
+                type: isKey ? 'key' : 'delta',
+                timestamp: Number(timestamp),
+                duration: duration,
+                data: frameData
+            });
+
+            // Configure decoder on first keyframe
+            if (isKey && this.decoder.state === 'unconfigured') {
+                this.log('Found keyframe in datagram, configuring decoder...', 'info');
+                await this.configureDecoderFromChunk(chunk, frameData);
+            }
+
+            if (this.decoder.state === 'configured') {
+                this.decoder.decode(chunk);
+                this.stats.framesReceived++;
+                this.stats.fpsCounter++;
+
+                // Calculate latency (ms)
+                const latency = nowMs - tsMs;
+                if (latency >= 0 && latency < 60000) {
+                    this.stats.latencySum += latency;
+                    this.stats.latencyCount++;
+                }
+            } else {
+                console.warn(`Skipping datagram frame - decoder state: ${this.decoder.state}, isKey: ${isKey}`);
+            }
+
+        } catch (error) {
+            console.error('processFrameData error:', error);
+        }
+    }
     
     async initDecoder() {
         this.log('Initializing video decoder...', 'info');
@@ -229,53 +320,8 @@ class LivestreamViewer {
             this.stats.bytesReceived += data.byteLength;
             
             console.log(`Received frame: ${data.byteLength} bytes`);
-            
-            // Parse frame header
-            if (data.byteLength < 16) {
-                console.error(`Frame too short: ${data.byteLength} bytes`);
-                return;
-            }
-            
-            const view = new DataView(data.buffer);
-            const timestamp = Number(view.getBigUint64(0, true));
-            const duration = view.getUint32(8, true);
-            const isKey = view.getUint8(12) === 1;
-            const size = view.getUint32(13, true) & 0xFFFFFF; // 3 bytes
-            
-            const frameData = data.slice(16);
-            
-            console.log(`Frame header - timestamp: ${timestamp}, duration: ${duration}, isKey: ${isKey}, size: ${size}, actual: ${frameData.byteLength}`);
-            
-            // Create EncodedVideoChunk
-            const chunk = new EncodedVideoChunk({
-                type: isKey ? 'key' : 'delta',
-                timestamp: timestamp,
-                duration: duration,
-                data: frameData
-            });
-            
-            // Configure decoder on first keyframe
-            if (isKey && this.decoder.state === 'unconfigured') {
-                this.log('Found keyframe, configuring decoder...', 'info');
-                await this.configureDecoderFromChunk(chunk, frameData);
-            }
-            
-            // Decode frame
-            if (this.decoder.state === 'configured') {
-                this.decoder.decode(chunk);
-                this.stats.framesReceived++;
-                this.stats.fpsCounter++;
-                
-                // Calculate latency
-                const now = Date.now();
-                const latency = now - (timestamp / 1000);
-                this.stats.latencySum += latency;
-                this.stats.latencyCount++;
-                
-                console.log(`Decoded frame #${this.stats.framesReceived} (keyframe: ${isKey})`);
-            } else {
-                console.warn(`Skipping frame - decoder state: ${this.decoder.state}, isKey: ${isKey}`);
-            }
+            // Delegate to shared frame processor (works for datagram & stream)
+            await this.processFrameData(data);
             
         } catch (error) {
             if (this.isConnected) {
@@ -346,10 +392,10 @@ class LivestreamViewer {
         // Add to buffer
         this.frameBuffer.push(frame);
         
-        // Limit buffer size
+        // Limit buffer size immediately to avoid memory growth
         while (this.frameBuffer.length > this.maxBufferSize) {
             const droppedFrame = this.frameBuffer.shift();
-            droppedFrame.close();
+            try { droppedFrame.close(); } catch (e) {}
             this.stats.droppedFrames++;
         }
     }
@@ -372,16 +418,21 @@ class LivestreamViewer {
                         this.canvas.height = frame.displayHeight;
                     }
                     
-                    // Draw frame to canvas
-                    this.ctx.drawImage(frame, 0, 0);
-                    
+                    // Draw frame to canvas using a bitmap for better performance
+                    try {
+                        const bitmap = await createImageBitmap(frame);
+                        this.ctx.drawImage(bitmap, 0, 0);
+                        bitmap.close();
+                    } catch (innerErr) {
+                        console.error('drawImage/createImageBitmap error:', innerErr);
+                    }
                 } catch (error) {
                     if (this.isPlaying) {
                         console.error('Playback error:', error);
                     }
+                } finally {
+                    try { frame.close(); } catch (e) {}
                 }
-                
-                frame.close();
             }
             
             // Wait for next animation frame
@@ -400,12 +451,12 @@ class LivestreamViewer {
         // Update FPS
         const now = Date.now();
         const elapsed = (now - this.stats.lastFpsUpdate) / 1000;
-        if (elapsed >= 1) {
-            const fps = Math.round(this.stats.fpsCounter / elapsed);
+        if (elapsed >= 0.25) {
+            const fps = Math.round(this.stats.fpsCounter / Math.max(elapsed, 0.0001));
             this.elements.fpsDisplay.textContent = fps;
             this.stats.fpsCounter = 0;
             this.stats.lastFpsUpdate = now;
-            
+
             // Update quality indicator based on FPS
             this.updateQualityIndicator(fps);
         }

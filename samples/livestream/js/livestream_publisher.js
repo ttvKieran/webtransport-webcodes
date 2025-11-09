@@ -19,10 +19,11 @@ class LivestreamPublisher {
         // Configuration
         this.config = {
             codec: 'VP8',
-            bitrate: 1000000,
-            framerate: 30,
-            width: 1280,
-            height: 720
+            // Lower defaults for better reliability by default
+            bitrate: 500000,
+            framerate: 20,
+            width: 640,
+            height: 360
         };
         
         this.initUI();
@@ -294,7 +295,9 @@ class LivestreamPublisher {
             const view = new DataView(data.buffer);
             
             // Header: [timestamp(8), duration(4), type(1), size(3)]
-            view.setBigUint64(0, BigInt(chunk.timestamp), true);
+            // Use epoch ms converted to microseconds so viewer can compute latency reliably
+            const tsMicro = BigInt(Date.now()) * 1000n;
+            view.setBigUint64(0, tsMicro, true);
             view.setUint32(8, chunk.duration || 0, true);
             view.setUint8(12, chunk.type === 'key' ? 1 : 0);
             view.setUint32(13, chunk.byteLength, true); // Only use 3 bytes in practice
@@ -304,8 +307,8 @@ class LivestreamPublisher {
             
             console.log(`Serialized frame: ${data.byteLength} bytes (header: 16, payload: ${chunk.byteLength})`);
             
-            // Send via WebTransport unidirectional stream
-            await this.sendFrame(data);
+            // Send via WebTransport datagram when supported (faster, lower overhead)
+            await this.sendDatagram(data);
             
             this.stats.framesSent++;
             this.stats.bytesSent += data.byteLength;
@@ -340,6 +343,39 @@ class LivestreamPublisher {
                 this.stop();
             }
             
+            if (this.isStreaming) {
+                throw error;
+            }
+        }
+    }
+
+    async sendDatagram(data) {
+        try {
+            if (!this.transport || this.transport.state === 'closed' || this.transport.state === 'failed') {
+                throw new Error('WebTransport connection is closed');
+            }
+
+            // Prefer datagrams if supported
+            if (this.transport.datagrams && this.transport.datagrams.send) {
+                // Check datagram size (QUIC datagram frame size limit)
+                const MAX_DATAGRAM_SIZE = 65536; // match server configuration
+                if (data.byteLength <= MAX_DATAGRAM_SIZE) {
+                    await this.transport.datagrams.send(data);
+                    return;
+                }
+            }
+
+            // Fallback to streams for large frames
+            await this.sendFrame(data);
+        } catch (error) {
+            console.error('sendDatagram error:', error);
+
+            // If connection is lost, stop streaming
+            if (error.message && (error.message.includes('Connection') || error.message.includes('closed'))) {
+                this.log('Connection lost, stopping stream', 'error');
+                this.stop();
+            }
+
             if (this.isStreaming) {
                 throw error;
             }
